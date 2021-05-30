@@ -70,7 +70,7 @@ def check_dominated(skeleton_queue, stream_plan):
 ##################################################
 
 def solve_abstract(problem, constraints=PlanConstraints(), stream_info={}, replan_actions=set(),
-                  unit_costs=False, success_cost=INF,
+                  unit_costs=False, success_cost=INF, parsed_domain=None,
                   max_time=INF, max_iterations=INF, max_memory=INF,
                   initial_complexity=0, complexity_step=1, max_complexity=INF,
                   max_skeletons=INF, search_sample_ratio=0, bind=True, max_failures=0,
@@ -125,7 +125,7 @@ def solve_abstract(problem, constraints=PlanConstraints(), stream_info={}, repla
 
     evaluations, goal_exp, domain, externals = parse_problem(
         problem, stream_info=stream_info, constraints=constraints,
-        unit_costs=unit_costs, unit_efforts=unit_efforts)
+        unit_costs=unit_costs, unit_efforts=unit_efforts, parsed_domain = parsed_domain)
     identify_non_producers(externals)
     enforce_simultaneous(domain, externals)
     compile_fluent_streams(domain, externals)
@@ -242,7 +242,7 @@ def solve_abstract(problem, constraints=PlanConstraints(), stream_info={}, repla
     print('Summary: {}'.format(str_from_object(summary, ndigits=3))) # TODO: return the summary
 
     write_stream_statistics(externals, verbose)
-    return store.extract_solution()
+    return store.extract_solution(), summary
 
 solve_focused = solve_abstract # TODO: deprecate solve_focused
 

@@ -72,12 +72,15 @@ def reset_globals():
     RULES[:] = []
     SOLUTIONS[:] = []
 
-def parse_problem(problem, stream_info={}, constraints=None, unit_costs=False, unit_efforts=False):
+def parse_problem(problem, stream_info={}, constraints=None, unit_costs=False, unit_efforts=False, parsed_domain=None):
     # TODO: just return the problem if already written programmatically
     #reset_globals() # Prevents use of satisfaction.py
     domain_pddl, constant_map, stream_pddl, stream_map, init, goal = problem
-
-    domain = parse_domain(domain_pddl) # TODO: normalize here
+    if(parsed_domain is not None):
+        domain = parsed_domain
+    else:
+        domain = parse_domain(domain_pddl) # TODO: normalize here
+        
     #domain = domain_pddl
     if len(domain.types) != 1:
         raise NotImplementedError('Types are not currently supported')
