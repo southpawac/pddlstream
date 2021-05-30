@@ -295,7 +295,7 @@ def get_problem(evaluations, goal_exp, domain, unit_costs=False):
     problem_pddl = None
     if USE_FORBID:
         problem_pddl = get_problem_pddl(evaluations, goal_exp, domain.pddl, temporal=False)
-    write_pddl(domain.pddl, problem_pddl)
+    # write_pddl(domain.pddl, problem_pddl)
     return Problem(task_name=domain.name, task_domain_name=domain.name,
                    objects=sorted(typed_objects, key=lambda o: o.name),
                    task_requirements=pddl.tasks.Requirements([]), init=init, goal=goal,
