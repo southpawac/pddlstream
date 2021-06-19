@@ -17,11 +17,15 @@ from pddlstream.language.temporal import solve_tfd, SimplifiedDomain
 from pddlstream.language.write_pddl import get_problem_pddl
 from pddlstream.utils import INF, Verbose, str_from_object, elapsed_time
 from GeneralizedTAMP.genqnp.tamp_feature_pool import encode_state_kb, populate_state_prolog, \
-    create_kb, get_object_list, get_query, get_all_concept_args
+    create_kb, get_object_list, get_query, findall_query_raw, get_all_concept_args, infer_object_type
 from GeneralizedTAMP.genqnp.database import Transition, TState
 from GeneralizedTAMP.genqnp.utils import objectify_expression
 from pddl import Atom, NegatedAtom, Conjunction, UniversalCondition, \
     ExistentialCondition, TypedObject
+from collections import defaultdict
+from GeneralizedTAMP.genqnp.language.planner import apply_action, t_get_action_instance
+import itertools
+import copy
 
 UPDATE_STATISTICS = False
 
@@ -101,6 +105,73 @@ def process_stream_queue(instantiator, store, complexity_limit=INF, verbose=Fals
 
 ##################################################
 
+
+def row_join(row1, row2):
+
+    # Join the two rows, returns none if they cannot be joined
+    new_row = {}
+    for row in [row1, row2]:
+        for k, v in row.items():
+            if (k in new_row.keys() and new_row[k] != v):
+                return None
+            else:
+                new_row[k] = v
+    return new_row
+
+
+def join(current_db, joining_db, negated=True):
+    new_db = []
+    # Todo: can be more efficient
+    if (current_db is None):
+        return joining_db
+    elif (joining_db is None):
+        return current_db
+    else:
+        for row1, row2 in itertools.product(current_db, joining_db):
+
+            joined_row = row_join(row1, row2)
+            if (joined_row != None):
+                new_db.append(joined_row)
+    return new_db
+
+
+def get_successor_gen(ground_atoms, parameters, preconditions, current_db=None):
+    ground_atoms_dict = defaultdict(list)
+    ground_negated_atoms_dict = defaultdict(list)
+
+    for ground_atom in ground_atoms:
+        if (isinstance(ground_atom, Atom)):
+            ground_atoms_dict[ground_atom.predicate].append(ground_atom.args)
+        elif (isinstance(ground_atom, NegatedAtom)):
+            ground_atoms_dict[ground_atom.predicate].append(ground_atom.args)
+        else:
+            raise NotImplementedError
+
+    preconditions.parts = sorted(list(preconditions.parts), key=lambda x: len(x.args), reverse=False)
+    variable_map = defaultdict(list)
+
+    for precondition_part in list(preconditions.parts):
+        if (len(precondition_part.args) > 0):
+            # For this precondition part, find every object combination which exists in the ground atoms
+
+            if (isinstance(precondition_part, Atom)):
+                pre_part_db = [{precondition_part.args[i]: args[i] for i in range(len(args))} for args in
+                               ground_atoms_dict[precondition_part.predicate]]
+            elif (isinstance(precondition_part, NegatedAtom)):
+                pre_part_db = [{precondition_part.args[i]: args[i] for i in range(len(args))} for args in
+                               ground_negated_atoms_dict[precondition_part.predicate]]
+            else:
+                raise NotImplementedError
+
+            current_db = join(current_db, pre_part_db)
+
+    def successor_gen():
+        for row in current_db:
+            yield row
+
+    return successor_gen
+
+
 def remove_new_axiom(cond):
     if(isinstance(cond, Conjunction)):
         new_parts = []
@@ -110,6 +181,39 @@ def remove_new_axiom(cond):
         return Conjunction(new_parts)
     else:
         raise NotImplementedError
+
+class MCTSNode():
+    def __init__(self, atoms):
+        self.atoms = atoms
+
+
+def evaluate_axioms(atoms, domain, task_domain_predicates, state_index):
+    atoms = sorted(atoms, key=lambda x: x.predicate)
+    kb_lines = encode_state_kb(atoms, state_index)
+    kb_lines = populate_state_prolog(domain, state_index) + kb_lines
+    kb = create_kb(kb_lines)
+
+    value_map = None
+    tstate = TState(atoms, value_map)
+    object_set = get_object_list([tstate], task_domain_predicates)
+    typed_object_set = [TypedObject(obj.name, infer_object_type(domain, obj, [atoms])) for obj in list(set(object_set))]
+    transition = Transition(None, atoms, value_map, typed_object_set, domain) # TODO atoms is the state  
+
+    for axiom in domain.axioms:
+        c = objectify_expression(axiom.condition)
+        results, valmap = findall_query_raw(axiom.parameters, transition, c, kb)
+        for result in results:
+            atoms.append(Atom(axiom.name, [valmap[obj] for obj in result]))
+    return atoms
+
+def check_goal(atoms, goal_atoms):
+    # First convert to hashable format
+    atom_tuples = [tuple([at.predicate]+[str(a.name) for a in at.args]) for at in atoms]
+    goal_tuples = [tuple([at.predicate]+[str(a.name) for a in at.args]) for at in goal_atoms]
+    non_goals = len([gt for gt in goal_tuples if gt not in atom_tuples])
+    return non_goals
+
+
 def solve_mcts(problem, constraints=PlanConstraints(),
                       unit_costs=False, success_cost=INF,
                       parsed_domain=None,
@@ -143,8 +247,19 @@ def solve_mcts(problem, constraints=PlanConstraints(),
     # complexity_step = INF => exhaustive
     # success_cost = terminate_cost = decision_cost
     # TODO: warning if optimizers are present
+
+
     evaluations, goal_expression, domain, externals = parse_problem(
-        problem, constraints=constraints, unit_costs=unit_costs, parsed_domain=parsed_domain)
+        problem, constraints=constraints, unit_costs=unit_costs)
+
+    problem = get_problem(evaluations, goal_expression, domain, unit_costs)
+
+    store = SolutionStore(evaluations, max_time, success_cost, verbose, max_memory=max_memory) # TODO: include other info here?
+
+    static_externals = compile_fluents_as_attachments(domain, externals)
+    instantiator = Instantiator(static_externals, evaluations) 
+    complexity = 2
+    process_stream_queue(instantiator, store, complexity, verbose=verbose)
 
 
     # Create the state in prolog
@@ -153,41 +268,59 @@ def solve_mcts(problem, constraints=PlanConstraints(),
         if(evaluation.head.function.islower() and "-" not in evaluation.head.function):
             atoms.append(Atom(evaluation.head.function, [TypedObject(a, "object") for a in evaluation.head.args]))
 
+    # goal expresion to formula
+    goal_atoms = []
+    assert goal_expression[0] == "and"
+    for goal_tuple in goal_expression[1:]:
+        if(goal_tuple[0].islower() and "-" not in goal_tuple[0]):
+            goal_atoms.append(Atom(goal_tuple[0], [TypedObject(a, "object") for a in goal_tuple[1:]]))
+    
+    edges = defaultdict(list) # state: takable actions
+
     atoms = sorted(atoms, key = lambda x: x.predicate) 
 
     state_index = 0
-    kb_lines = encode_state_kb(atoms, state_index)
-    kb_lines = populate_state_prolog(parsed_domain, state_index) + kb_lines
-    kb = create_kb(kb_lines)
+    
 
     # Evaluate the preconditions of each action for this state in prolog
     task_domain_predicates = [p.name for p in parsed_domain.predicates]
 
+    task = task_from_domain_problem(domain, problem)
+    atoms = evaluate_axioms(atoms, parsed_domain, task_domain_predicates, 0)
+    non_goal = check_goal(atoms, goal_atoms)
+    if(non_goal == 0):
+        return [], None
 
-    for action in parsed_domain.actions:
-        value_map = None
-        tstate = TState(atoms, value_map)
-        object_set = get_object_list([tstate], task_domain_predicates)
-        transition = Transition(action, atoms, value_map, object_set, parsed_domain) # TODO atoms is the state  
-        c = objectify_expression(action.precondition)
-        c = remove_new_axiom(c)
-        arg_set = get_all_concept_args(c)
-        full_cond = ExistentialCondition(list(arg_set), [c])
-        query = get_query(full_cond, transition)
-        print(len(list(kb.query(query))))
+    Q = [MCTSNode(atoms)]
+    print("Bfs start")
+    state_index = 1
+    while(len(Q)>0):
+        q = Q.pop(0)
+        # Evaluate the preconditions of each action for this state in prolog
+        for action in parsed_domain.actions:
+            c = objectify_expression(action.precondition)
+            c = remove_new_axiom(c)
+            atoms = copy.copy(q.atoms)
+            successors = get_successor_gen(q.atoms, action.parameters, c)
+            for successor_action in (successors()):
+                # Take an action
+                successor_action_simp = {k.name: v for k, v in successor_action.items()}
+                instance = t_get_action_instance(task, action.name, [successor_action_simp[param.name].name for param in action.parameters])
+                stringed_atoms = [Atom(a.predicate, [arg.name for arg in a.args]) for a in atoms]
+                new_atoms = apply_action(stringed_atoms, instance)
+                objectified_atoms = [Atom(a.predicate, [TypedObject(str(arg), "object") for arg in a.args]) for a in new_atoms]
+                new_objectified_atoms = evaluate_axioms(objectified_atoms, parsed_domain, task_domain_predicates, state_index)
+                print(check_goal(atoms, goal_atoms))
+                new_node = MCTSNode(objectified_atoms)
+                edges[q].append((successor_action, new_node))
+                state_index+=1
+                Q.append(new_node)
 
-        import sys
-        sys.exit(1)
+        print(Q)
+       
 
 
-    # store = SolutionStore(evaluations, max_time, success_cost, verbose, max_memory=max_memory) # TODO: include other info here?
-    # if UPDATE_STATISTICS:
-    #     load_stream_statistics(externals)
-    # static_externals = compile_fluents_as_attachments(domain, externals)
-    # num_iterations = num_calls = 0
-    # complexity_limit = initial_complexity
-    # instantiator = Instantiator(static_externals, evaluations)
-    # num_calls += process_stream_queue(instantiator, store, complexity_limit, verbose=verbose)
+
     # while not store.is_terminated() and (num_iterations < max_iterations) and (complexity_limit <= max_complexity):
     #     num_iterations += 1
     #     print('Iteration: {} | Complexity: {} | Calls: {} | Evaluations: {} | Solved: {} | Cost: {:.3f} | '
