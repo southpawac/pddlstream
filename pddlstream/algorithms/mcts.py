@@ -93,16 +93,6 @@ def process_stream_queue(instantiator, store, complexity_limit=INF, verbose=Fals
             str_from_object(Counter(instance.external.name for instance in instances))))
     return len(instances)
 
-# def retrace_stream_plan(store, domain, goal_expression):
-#     # TODO: retrace the stream plan that supports the plan to find the certificate
-#     if store.best_plan is None:
-#         return None
-#     assert not domain.axioms
-#     from pddlstream.algorithms.downward import plan_preimage
-#     print(goal_expression)
-#     plan_preimage(store.best_plan, goal_expression)
-#     raise NotImplementedError()
-
 ##################################################
 
 
@@ -128,7 +118,6 @@ def join(current_db, joining_db, negated=True):
         return current_db
     else:
         for row1, row2 in itertools.product(current_db, joining_db):
-
             joined_row = row_join(row1, row2)
             if (joined_row != None):
                 new_db.append(joined_row)
@@ -136,14 +125,15 @@ def join(current_db, joining_db, negated=True):
 
 
 def get_successor_gen(ground_atoms, parameters, preconditions, current_db=None):
+    
+
     ground_atoms_dict = defaultdict(list)
     ground_negated_atoms_dict = defaultdict(list)
-
     for ground_atom in ground_atoms:
         if (isinstance(ground_atom, Atom)):
             ground_atoms_dict[ground_atom.predicate].append(ground_atom.args)
         elif (isinstance(ground_atom, NegatedAtom)):
-            ground_atoms_dict[ground_atom.predicate].append(ground_atom.args)
+            ground_negated_atoms_dict[ground_atom.predicate].append(ground_atom.args)
         else:
             raise NotImplementedError
 
@@ -151,19 +141,18 @@ def get_successor_gen(ground_atoms, parameters, preconditions, current_db=None):
     variable_map = defaultdict(list)
 
     for precondition_part in list(preconditions.parts):
-        if (len(precondition_part.args) > 0):
-            # For this precondition part, find every object combination which exists in the ground atoms
+        # For this precondition part, find every object combination which exists in the ground atoms
+        if (isinstance(precondition_part, Atom)):
+            pre_part_db = [{precondition_part.args[i]: args[i] for i in range(len(args))} for args in
+                           ground_atoms_dict[precondition_part.predicate]]
+        elif (isinstance(precondition_part, NegatedAtom)):
+            pre_part_db = [{precondition_part.args[i]: args[i] for i in range(len(args))} for args in
+                           ground_negated_atoms_dict[precondition_part.predicate]]
+        else:
+            raise NotImplementedError
 
-            if (isinstance(precondition_part, Atom)):
-                pre_part_db = [{precondition_part.args[i]: args[i] for i in range(len(args))} for args in
-                               ground_atoms_dict[precondition_part.predicate]]
-            elif (isinstance(precondition_part, NegatedAtom)):
-                pre_part_db = [{precondition_part.args[i]: args[i] for i in range(len(args))} for args in
-                               ground_negated_atoms_dict[precondition_part.predicate]]
-            else:
-                raise NotImplementedError
 
-            current_db = join(current_db, pre_part_db)
+        current_db = join(current_db, pre_part_db)
 
     def successor_gen():
         for row in current_db:
@@ -183,8 +172,11 @@ def remove_new_axiom(cond):
         raise NotImplementedError
 
 class MCTSNode():
-    def __init__(self, atoms):
-        self.atoms = atoms
+    def __init__(self, state, action_name, action_args, next_state):
+        self.state = state
+        self.action_name = action_name
+        self.action_args = action_args
+        self.next_state = next_state
 
 
 def evaluate_axioms(atoms, domain, task_domain_predicates, state_index):
@@ -197,7 +189,7 @@ def evaluate_axioms(atoms, domain, task_domain_predicates, state_index):
     tstate = TState(atoms, value_map)
     object_set = get_object_list([tstate], task_domain_predicates)
     typed_object_set = [TypedObject(obj.name, infer_object_type(domain, obj, [atoms])) for obj in list(set(object_set))]
-    transition = Transition(None, atoms, value_map, typed_object_set, domain) # TODO atoms is the state  
+    transition = Transition(None, atoms, value_map, typed_object_set, domain, index=state_index) # TODO atoms is the state  
 
     for axiom in domain.axioms:
         c = objectify_expression(axiom.condition)
@@ -258,7 +250,8 @@ def solve_mcts(problem, constraints=PlanConstraints(),
 
     static_externals = compile_fluents_as_attachments(domain, externals)
     instantiator = Instantiator(static_externals, evaluations) 
-    complexity = 2
+
+    complexity = 4
     process_stream_queue(instantiator, store, complexity, verbose=verbose)
 
 
@@ -281,77 +274,71 @@ def solve_mcts(problem, constraints=PlanConstraints(),
 
     state_index = 0
     
-
     # Evaluate the preconditions of each action for this state in prolog
     task_domain_predicates = [p.name for p in parsed_domain.predicates]
 
     task = task_from_domain_problem(domain, problem)
-    atoms = evaluate_axioms(atoms, parsed_domain, task_domain_predicates, 0)
+    axiom_atoms = evaluate_axioms(atoms, parsed_domain, task_domain_predicates, 0)
     non_goal = check_goal(atoms, goal_atoms)
     if(non_goal == 0):
         return [], None
 
-    Q = [MCTSNode(atoms)]
+    parent = defaultdict(lambda: None)
+    Q = [MCTSNode(None, None, None, atoms)]
     print("Bfs start")
     state_index = 1
+    evaluated = []
+    it = 0 
     while(len(Q)>0):
+        print("Iteration {}".format(it))
         q = Q.pop(0)
         # Evaluate the preconditions of each action for this state in prolog
         for action in parsed_domain.actions:
             c = objectify_expression(action.precondition)
             c = remove_new_axiom(c)
-            atoms = copy.copy(q.atoms)
-            successors = get_successor_gen(q.atoms, action.parameters, c)
-            for successor_action in (successors()):
+            atoms = copy.copy(q.next_state)
+            successors = get_successor_gen(q.next_state, action.parameters, c)()
+            for successor_action in successors:
                 # Take an action
+                st = time.time()
                 successor_action_simp = {k.name: v for k, v in successor_action.items()}
+                val_map = {str(v.name): v for v in successor_action.values()}
                 instance = t_get_action_instance(task, action.name, [successor_action_simp[param.name].name for param in action.parameters])
-                stringed_atoms = [Atom(a.predicate, [arg.name for arg in a.args]) for a in atoms]
-                new_atoms = apply_action(stringed_atoms, instance)
-                objectified_atoms = [Atom(a.predicate, [TypedObject(str(arg), "object") for arg in a.args]) for a in new_atoms]
-                new_objectified_atoms = evaluate_axioms(objectified_atoms, parsed_domain, task_domain_predicates, state_index)
-                print(check_goal(atoms, goal_atoms))
-                new_node = MCTSNode(objectified_atoms)
-                edges[q].append((successor_action, new_node))
-                state_index+=1
-                Q.append(new_node)
+                new_atoms = apply_action(atoms, instance, val_map=val_map)
+                print(st-time.time())
+                print("Add: {}".format(new_atoms-set(atoms)))
+                print("Del: {}".format(set(atoms)-new_atoms))
+                objectified_atoms = [Atom(a.predicate, [TypedObject(str(arg.name), "object") for arg in a.args]) for a in new_atoms]
 
-        print(Q)
-       
+                if(frozenset(objectified_atoms) not in evaluated):
+                    evaluated.append(frozenset(objectified_atoms))
+                    axiom_objectified_atoms = evaluate_axioms(objectified_atoms, parsed_domain, task_domain_predicates, state_index)
+
+                    goal_atoms_rem = check_goal(axiom_objectified_atoms, goal_atoms)
+                    new_node = MCTSNode(atoms, action.name, [successor_action_simp[param.name].name.value for param in action.parameters], new_atoms)
+                    edges[q].append((successor_action, new_node))
+                    state_index+=1
+                    Q.append(new_node)
+                    parent[new_node] = q
+                    print("Goals left: "+str(goal_atoms_rem))
+                    if(goal_atoms_rem == 0):
+                        # GOAL                 
+                        plan  = [new_node]
+                        parent_node = parent[new_node]
+                        while(parent_node != None):
+                            plan.append(parent_node)
+                            parent_node = parent[parent_node]
+
+                        plan_nodes = [(plan_node.action_name, plan_node.action_args) for plan_node in list(reversed(plan))]
+                        return (plan_nodes[1:], 0, evaluations), None
 
 
+        # if(it == 5):
+        #     import sys
+        #     sys.exit(1)
+        it+=1
 
-    # while not store.is_terminated() and (num_iterations < max_iterations) and (complexity_limit <= max_complexity):
-    #     num_iterations += 1
-    #     print('Iteration: {} | Complexity: {} | Calls: {} | Evaluations: {} | Solved: {} | Cost: {:.3f} | '
-    #           'Search Time: {:.3f} | Sample Time: {:.3f} | Time: {:.3f}'.format(
-    #         num_iterations, complexity_limit, num_calls, len(evaluations),
-    #         store.has_solution(), store.best_cost, store.search_time, store.sample_time, store.elapsed_time()))
-    #     plan, cost = solve_finite(evaluations, goal_expression, domain,
-    #                               max_cost=min(store.best_cost, constraints.max_cost), **search_kwargs)
-    #     if is_plan(plan):
-    #         store.add_plan(plan, cost)
-    #     if not instantiator:
-    #         break
-    #     if complexity_step is None:
-    #         # TODO: option to select the next k-smallest complexities
-    #         complexity_limit = instantiator.min_complexity()
-    #     else:
-    #         complexity_limit += complexity_step
-    #     num_calls += process_stream_queue(instantiator, store, complexity_limit, verbose=verbose)
-    # #retrace_stream_plan(store, domain, goal_expression)
-    # #print('Final queue size: {}'.format(len(instantiator)))
+    assert False, "No plan found"
 
-    # summary = store.export_summary()
-    # summary.update({
-    #     'iterations': num_iterations,
-    #     'complexity': complexity_limit,
-    # })
-    # print('Summary: {}'.format(str_from_object(summary, ndigits=3))) # TODO: return the summary
 
-    # if UPDATE_STATISTICS:
-    #     write_stream_statistics(externals, verbose)
-
-    # summary = store.export_summary()
-    return store.extract_solution(), None
 
