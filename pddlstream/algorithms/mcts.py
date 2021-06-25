@@ -23,9 +23,10 @@ from GeneralizedTAMP.genqnp.utils import objectify_expression
 from pddl import Atom, NegatedAtom, Conjunction, UniversalCondition, \
     ExistentialCondition, TypedObject
 from collections import defaultdict
-from GeneralizedTAMP.genqnp.language.planner import apply_action, t_get_action_instance
+from GeneralizedTAMP.genqnp.language.planner import t_get_action_instance
 import itertools
 import copy
+import pddl 
 
 UPDATE_STATISTICS = False
 
@@ -161,6 +162,36 @@ def get_successor_gen(ground_atoms, parameters, preconditions, current_db=None):
     return successor_gen
 
 
+
+def apply_action(state, objectify_state, action, val_map=None):
+    # print(action.name)
+    assert (isinstance(action, pddl.PropositionalAction))
+    # TODO: signed literals
+    del_state = []
+    for conditions, effect in action.del_effects:
+        if conditions_hold(state, conditions):
+            del_state.append(tuple([effect.predicate]+list(effect.args)))
+
+    new_state = []
+    new_objectify_state = []
+    for (orig_state,state_el) in zip(list(state), list(objectify_state)) :
+        if tuple([state_el.predicate]+[arg.name for arg in state_el.args]) not in del_state:
+            new_state.append(orig_state)
+            new_objectify_state.append(state_el)
+
+    state = set(new_state)
+
+
+    for conditions, effect in action.add_effects:
+        if conditions_hold(state, conditions):
+            if(val_map is not None):
+                state.add( Atom(effect.predicate, [val_map[a] for a in effect.args] ))
+            else:
+                state.add(effect)
+
+
+    return set(state)
+
 def remove_new_axiom(cond):
     if(isinstance(cond, Conjunction)):
         new_parts = []
@@ -197,6 +228,10 @@ def evaluate_axioms(atoms, domain, task_domain_predicates, state_index):
         for result in results:
             atoms.append(Atom(axiom.name, [valmap[obj] for obj in result]))
     return atoms
+
+def conditions_hold(state, conditions):
+    return all(literal_holds(state, cond) for cond in conditions)
+
 
 def check_goal(atoms, goal_atoms):
     # First convert to hashable format
@@ -288,33 +323,62 @@ def solve_mcts(problem, constraints=PlanConstraints(),
     print("Bfs start")
     state_index = 1
     evaluated = []
+    objectify_dict = {}
     it = 0 
     while(len(Q)>0):
         print("Iteration {}".format(it))
         q = Q.pop(0)
         # Evaluate the preconditions of each action for this state in prolog
         for action in parsed_domain.actions:
+            st = time.time()
             c = objectify_expression(action.precondition)
             c = remove_new_axiom(c)
             atoms = copy.copy(q.next_state)
             successors = get_successor_gen(q.next_state, action.parameters, c)()
+            print("Get successorts : "+str(st-time.time()))
             for successor_action in successors:
                 # Take an action
                 st = time.time()
                 successor_action_simp = {k.name: v for k, v in successor_action.items()}
                 val_map = {str(v.name): v for v in successor_action.values()}
                 instance = t_get_action_instance(task, action.name, [successor_action_simp[param.name].name for param in action.parameters])
-                new_atoms = apply_action(atoms, instance, val_map=val_map)
-                print(st-time.time())
+
+                # Objectify original atoms
+                objectified_atoms=[]
+                for a in atoms:
+                    if(a in objectify_dict):
+                        objectified_atoms.append(objectify_dict[a])
+                    else:
+                        objectified_atoms.append(Atom(a.predicate, [TypedObject(str(arg.name), "object") for arg in a.args]))
+                        objectify_dict[a] = objectified_atoms[-1]
+
+                new_atoms = apply_action(atoms, objectified_atoms, instance, val_map=val_map)
+                print("Get and apply action : "+str(st-time.time()))
+                st = time.time()
                 print("Add: {}".format(new_atoms-set(atoms)))
                 print("Del: {}".format(set(atoms)-new_atoms))
-                objectified_atoms = [Atom(a.predicate, [TypedObject(str(arg.name), "object") for arg in a.args]) for a in new_atoms]
+
+                # Objectify new atoms
+                objectified_atoms=[]
+                for a in new_atoms:
+                    if(a in objectify_dict):
+                        objectified_atoms.append(objectify_dict[a])
+                    else:
+                        objectified_atoms.append(Atom(a.predicate, [TypedObject(str(arg.name), "object") for arg in a.args]))
+                        objectify_dict[a] = objectified_atoms[-1]
+
+
+                objectified_atoms = [objectify_dict[a] for a in new_atoms]
+                print("Objectify atoms : "+str(st-time.time()))
 
                 if(frozenset(objectified_atoms) not in evaluated):
+                    st = time.time()
                     evaluated.append(frozenset(objectified_atoms))
                     axiom_objectified_atoms = evaluate_axioms(objectified_atoms, parsed_domain, task_domain_predicates, state_index)
-
+                    print("Evaluate axioms : "+str(st-time.time()))
+                    st = time.time()
                     goal_atoms_rem = check_goal(axiom_objectified_atoms, goal_atoms)
+                    print("Check goal : "+str(st-time.time()))
                     new_node = MCTSNode(atoms, action.name, [successor_action_simp[param.name].name.value for param in action.parameters], new_atoms)
                     edges[q].append((successor_action, new_node))
                     state_index+=1
