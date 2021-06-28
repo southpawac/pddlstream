@@ -26,7 +26,12 @@ from collections import defaultdict
 from GeneralizedTAMP.genqnp.language.planner import t_get_action_instance
 import itertools
 import copy
-import pddl 
+import pddl
+import importlib
+import pyswip
+from collections import namedtuple
+
+Certificate = namedtuple('Certificate', ['all_facts', 'preimage_facts', 'plan_graph'])
 
 UPDATE_STATISTICS = False
 
@@ -200,7 +205,7 @@ def remove_new_axiom(cond):
                 new_parts.append(cond_part)
         return Conjunction(new_parts)
     else:
-        raise NotImplementedError
+        return remove_new_axiom(Conjunction([cond]))
 
 class MCTSNode():
     def __init__(self, state, action_name, action_args, next_state):
@@ -208,6 +213,11 @@ class MCTSNode():
         self.action_name = action_name
         self.action_args = action_args
         self.next_state = next_state
+
+class MCTSGraph():
+    def __init__(self, nodes, edges):
+        self.nodes = nodes
+        self.edges = edges
 
 
 def evaluate_axioms(atoms, domain, task_domain_predicates, state_index):
@@ -220,13 +230,18 @@ def evaluate_axioms(atoms, domain, task_domain_predicates, state_index):
     tstate = TState(atoms, value_map)
     object_set = get_object_list([tstate], task_domain_predicates)
     typed_object_set = [TypedObject(obj.name, infer_object_type(domain, obj, [atoms])) for obj in list(set(object_set))]
+
     transition = Transition(None, atoms, value_map, typed_object_set, domain, index=state_index) # TODO atoms is the state  
 
     for axiom in domain.axioms:
         c = objectify_expression(axiom.condition)
         results, valmap = findall_query_raw(axiom.parameters, transition, c, kb)
+
         for result in results:
-            atoms.append(Atom(axiom.name, [valmap[obj] for obj in result]))
+            axiom_atom = Atom(axiom.name, [valmap[obj] for obj in result])
+            print(axiom_atom)
+            atoms.append(axiom_atom)
+
     return atoms
 
 def conditions_hold(state, conditions):
@@ -240,6 +255,16 @@ def check_goal(atoms, goal_atoms):
     non_goals = len([gt for gt in goal_tuples if gt not in atom_tuples])
     return non_goals
 
+
+def get_objectified_atoms(atoms, cache):
+    objectified_atoms=[]
+    for a in atoms:
+        if(a in cache):
+            objectified_atoms.append(cache[a])
+        else:
+            objectified_atoms.append(Atom(a.predicate, [TypedObject(str(arg.name), "object") for arg in a.args]))
+            cache[a] = objectified_atoms[-1]
+    return objectified_atoms, cache
 
 def solve_mcts(problem, constraints=PlanConstraints(),
                       unit_costs=False, success_cost=INF,
@@ -289,7 +314,6 @@ def solve_mcts(problem, constraints=PlanConstraints(),
     complexity = 4
     process_stream_queue(instantiator, store, complexity, verbose=verbose)
 
-
     # Create the state in prolog
     atoms = []
     for evaluation in evaluations:
@@ -307,36 +331,53 @@ def solve_mcts(problem, constraints=PlanConstraints(),
 
     atoms = sorted(atoms, key = lambda x: x.predicate) 
 
-    state_index = 0
+    state_index = int(time.time()*100)
     
     # Evaluate the preconditions of each action for this state in prolog
     task_domain_predicates = [p.name for p in parsed_domain.predicates]
 
     task = task_from_domain_problem(domain, problem)
-    axiom_atoms = evaluate_axioms(atoms, parsed_domain, task_domain_predicates, 0)
-    non_goal = check_goal(atoms, goal_atoms)
+
+    # # Temporary speedup workaround
+    # axiom_atoms = copy.deepcopy(atoms)
+    # for axiom in domain.axioms:
+    #     c = objectify_expression(axiom.condition)
+    #     succgen = get_successor_gen(atoms, axiom.parameters, c)()
+    #     for res in succgen:
+    #         axiom_atoms.append(Atom(axiom.name, [ TypedObject(res[axiom.parameters[0]].name, "block_type"), TypedObject(res[axiom.parameters[1]].name, "region_type") ]))
+
+    axiom_atoms = evaluate_axioms(atoms, parsed_domain, task_domain_predicates, state_index)
+    objectified_atoms, objectify_dict = get_objectified_atoms(axiom_atoms, {})
+    non_goal = check_goal(objectified_atoms, goal_atoms)
+
+    # Check if goal already achieved
     if(non_goal == 0):
         return [], None
 
     parent = defaultdict(lambda: None)
-    Q = [MCTSNode(None, None, None, atoms)]
+    Q = [(MCTSNode(None, None, None, axiom_atoms), non_goal)]
+
+    QNodes = copy.deepcopy(Q)
+    print("non_goal: "+str(non_goal))
     print("Bfs start")
-    state_index = 1
     evaluated = []
-    objectify_dict = {}
-    it = 0 
+    it = 0
     while(len(Q)>0):
         print("Iteration {}".format(it))
-        q = Q.pop(0)
+        Q = sorted(Q, key=lambda k: k[1])
+        q, h = Q.pop(0)
         # Evaluate the preconditions of each action for this state in prolog
         for action in parsed_domain.actions:
+            print(action)
             st = time.time()
             c = objectify_expression(action.precondition)
             c = remove_new_axiom(c)
             atoms = copy.copy(q.next_state)
+
             successors = get_successor_gen(q.next_state, action.parameters, c)()
             print("Get successorts : "+str(st-time.time()))
             for successor_action in successors:
+                print(successor_action)
                 # Take an action
                 st = time.time()
                 successor_action_simp = {k.name: v for k, v in successor_action.items()}
@@ -344,14 +385,7 @@ def solve_mcts(problem, constraints=PlanConstraints(),
                 instance = t_get_action_instance(task, action.name, [successor_action_simp[param.name].name for param in action.parameters])
 
                 # Objectify original atoms
-                objectified_atoms=[]
-                for a in atoms:
-                    if(a in objectify_dict):
-                        objectified_atoms.append(objectify_dict[a])
-                    else:
-                        objectified_atoms.append(Atom(a.predicate, [TypedObject(str(arg.name), "object") for arg in a.args]))
-                        objectify_dict[a] = objectified_atoms[-1]
-
+                objectified_atoms, objectify_dict = get_objectified_atoms(atoms, objectify_dict)
                 new_atoms = apply_action(atoms, objectified_atoms, instance, val_map=val_map)
                 print("Get and apply action : "+str(st-time.time()))
                 st = time.time()
@@ -370,11 +404,12 @@ def solve_mcts(problem, constraints=PlanConstraints(),
 
                 objectified_atoms = [objectify_dict[a] for a in new_atoms]
                 print("Objectify atoms : "+str(st-time.time()))
-
+                state_index+=1
                 if(frozenset(objectified_atoms) not in evaluated):
                     st = time.time()
                     evaluated.append(frozenset(objectified_atoms))
                     axiom_objectified_atoms = evaluate_axioms(objectified_atoms, parsed_domain, task_domain_predicates, state_index)
+                    # print(set(axiom_objectified_atoms)-set(objectified_atoms))
                     print("Evaluate axioms : "+str(st-time.time()))
                     st = time.time()
                     goal_atoms_rem = check_goal(axiom_objectified_atoms, goal_atoms)
@@ -382,9 +417,10 @@ def solve_mcts(problem, constraints=PlanConstraints(),
                     new_node = MCTSNode(atoms, action.name, [successor_action_simp[param.name].name.value for param in action.parameters], new_atoms)
                     edges[q].append((successor_action, new_node))
                     state_index+=1
-                    Q.append(new_node)
-                    parent[new_node] = q
                     print("Goals left: "+str(goal_atoms_rem))
+                    Q.append((new_node, goal_atoms_rem))
+                    QNodes.append(new_node)
+                    parent[new_node] = q
                     if(goal_atoms_rem == 0):
                         # GOAL                 
                         plan  = [new_node]
@@ -394,12 +430,8 @@ def solve_mcts(problem, constraints=PlanConstraints(),
                             parent_node = parent[parent_node]
 
                         plan_nodes = [(plan_node.action_name, plan_node.action_args) for plan_node in list(reversed(plan))]
-                        return (plan_nodes[1:], 0, evaluations), None
+                        return (plan_nodes[1:], 0, Certificate(all_facts=evaluations, preimage_facts=None, plan_graph=MCTSGraph(QNodes, dict(parent))) ), None
 
-
-        # if(it == 5):
-        #     import sys
-        #     sys.exit(1)
         it+=1
 
     assert False, "No plan found"
